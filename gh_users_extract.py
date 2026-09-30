@@ -91,6 +91,13 @@ def to_cell(v):
 LAST_ACCESSED_COL = "last_accessed"
 ROLE_COL, ORG_COL, LICENSE_COL = "role", "org", "License"
 ID_COL = "user_id"
+EMAIL_COL = "email"
+# something@domain.tld  -> no spaces, exactly one @, a dot in the domain
+EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s.]{2,}$")
+
+
+def is_valid_email(v):
+    return isinstance(v, str) and bool(EMAIL_RE.match(v.strip()))
 # Fixed namespace: the same username always gets the same user_id, run after run
 ID_NAMESPACE = uuid.uuid5(uuid.NAMESPACE_DNS, "github.users.flexera")
 
@@ -165,6 +172,8 @@ def main():
         i_acc = col_index(columns, LAST_ACCESSED_COL)
         i_role = col_index(columns, ROLE_COL)
         i_org = col_index(columns, ORG_COL)
+        i_email = col_index(columns, EMAIL_COL)
+        bad_email, bad_email_samples = 0, []
         sep = env("LICENSE_SEPARATOR", " - ")
         id_fields = [c.strip() for c in env("ID_FIELDS", "username").split(",") if c.strip()]
         i_ids = [col_index(columns, c) for c in id_fields]
@@ -185,6 +194,12 @@ def main():
                     # 1. drop never-accessed rows (0001-01-01)
                     if is_null_date(r[i_acc]):
                         removed += 1
+                        continue
+                    # 1b. drop rows whose email is not a real address (no @ etc.)
+                    if not is_valid_email(r[i_email]):
+                        bad_email += 1
+                        if len(bad_email_samples) < 10:
+                            bad_email_samples.append(f"{r[i_role]} | {r[i_org]} | {r[i_email]!r}")
                         continue
                     row = [to_cell(v) for v in r]
                     # 2. last_accessed -> ISO 8601 UTC, like last_updated
@@ -213,8 +228,11 @@ def main():
     except PermissionError:
         sys.exit(f"[save] {out_file.name} is open (probably in Excel). Close it and re-run.\n"
                  f"       This run's data is kept in {tmp_file}")
-    status = "OK" if written + removed == expected else "MISMATCH"
+    status = "OK" if written + removed + bad_email == expected else "MISMATCH"
     print(f"[filter] Removed {removed:,} rows with {LAST_ACCESSED_COL} = 0001-01-01")
+    print(f"[filter] Removed {bad_email:,} rows with an invalid {EMAIL_COL}")
+    for sample in bad_email_samples:
+        print(f"         e.g. {sample}")
     if blank_ids:
         print(f"[warn] {blank_ids:,} rows have no {'/'.join(id_fields)} -> blank {ID_COL}")
     if dup_ids:
@@ -222,7 +240,7 @@ def main():
               f"(same {'/'.join(id_fields)} appears more than once)")
     if blank_acc:
         print(f"[warn] {blank_acc:,} kept rows have an empty {LAST_ACCESSED_COL}")
-    print(f"[done] {status}: wrote {written:,} rows (+{removed:,} removed = {expected:,}) -> {out_file}")
+    print(f"[done] {status}: wrote {written:,} rows (+{removed + bad_email:,} removed = {expected:,}) -> {out_file}")
     if status != "OK":
         sys.exit(1)
 
