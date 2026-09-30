@@ -136,7 +136,8 @@ def main():
     fq_table, table = qualified_table()
     out_dir = BASE_DIR / env("OUTPUT_DIR", "output")
     out_dir.mkdir(parents=True, exist_ok=True)
-    out_file = out_dir / f"{table}_{datetime.now():%Y%m%d_%H%M%S}.csv"
+    out_file = out_dir / env("OUTPUT_FILE", f"{table}.csv")
+    tmp_file = out_file.with_suffix(out_file.suffix + ".tmp")
 
     print(f"[connect] {env('SQL_SERVER')} / {env('SQL_DATABASE')} as {env('SQL_USERNAME')}")
     try:
@@ -160,7 +161,8 @@ def main():
 
         written = removed = blank_acc = 0
         # utf-8-sig so Excel opens accented names correctly
-        with open(out_file, "w", newline="", encoding="utf-8-sig") as f:
+        # write to a temp file first; the real file is only replaced on success
+        with open(tmp_file, "w", newline="", encoding="utf-8-sig") as f:
             writer = csv.writer(f)
             writer.writerow(columns + [LICENSE_COL])
             while True:
@@ -187,6 +189,11 @@ def main():
                 print(f"[write] {written + removed:,}/{expected:,} processed", end="\r")
 
     print()
+    try:
+        os.replace(tmp_file, out_file)
+    except PermissionError:
+        sys.exit(f"[save] {out_file.name} is open (probably in Excel). Close it and re-run.\n"
+                 f"       This run's data is kept in {tmp_file}")
     status = "OK" if written + removed == expected else "MISMATCH"
     print(f"[filter] Removed {removed:,} rows with {LAST_ACCESSED_COL} = 0001-01-01")
     if blank_acc:
