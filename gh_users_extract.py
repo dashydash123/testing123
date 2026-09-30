@@ -10,7 +10,7 @@ import csv
 import os
 import re
 import sys
-from datetime import datetime
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 try:
@@ -86,6 +86,52 @@ def to_cell(v):
     return v
 
 
+# ── Transform settings ──────────────────────────────────────────────
+LAST_ACCESSED_COL = "last_accessed"
+ROLE_COL, ORG_COL, LICENSE_COL = "role", "org", "License"
+ISO_FMT = "%Y-%m-%dT%H:%M:%SZ"          # same shape as last_updated
+_STR_FORMATS = ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S.%f",
+                "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d", "%m/%d/%Y %H:%M:%S", "%m/%d/%Y")
+
+
+def is_null_date(v):
+    """True for the 0001-01-01 'never accessed' placeholder."""
+    if isinstance(v, (datetime, date)):
+        return v.year == 1
+    return isinstance(v, str) and v.strip().startswith("0001-01-01")
+
+
+def to_iso_utc(v):
+    """Convert datetime/date/string to 2026-09-29T10:22:33Z. Blank stays blank."""
+    if v is None or (isinstance(v, str) and not v.strip()):
+        return ""
+    if isinstance(v, str):
+        raw = v.strip().replace("Z", "").split("+")[0]
+        raw = raw[:26]  # trim 7-digit SQL fractions to what strptime accepts
+        for fmt in _STR_FORMATS:
+            try:
+                v = datetime.strptime(raw, fmt)
+                break
+            except ValueError:
+                continue
+        else:
+            raise ValueError(f"Unrecognised {LAST_ACCESSED_COL} value: {v!r}")
+    if isinstance(v, datetime):
+        if v.tzinfo is not None:
+            v = v.astimezone(timezone.utc).replace(tzinfo=None)
+        return v.strftime(ISO_FMT)
+    if isinstance(v, date):
+        return datetime(v.year, v.month, v.day).strftime(ISO_FMT)
+    raise ValueError(f"Unsupported {LAST_ACCESSED_COL} type: {type(v).__name__}")
+
+
+def col_index(columns, name):
+    lookup = {c.lower(): i for i, c in enumerate(columns)}
+    if name.lower() not in lookup:
+        sys.exit(f"[transform] Column '{name}' not found. Columns: {columns}")
+    return lookup[name.lower()]
+
+
 def main():
     fq_table, table = qualified_table()
     out_dir = BASE_DIR / env("OUTPUT_DIR", "output")
@@ -107,22 +153,45 @@ def main():
         columns = [c[0] for c in cur.description]
         print(f"[query] Columns: {', '.join(columns)}")
 
-        written = 0
-        # utf-8-sig so Excel opens accented names (e.g. Pedrilho, Panzieri) correctly
+        i_acc = col_index(columns, LAST_ACCESSED_COL)
+        i_role = col_index(columns, ROLE_COL)
+        i_org = col_index(columns, ORG_COL)
+        sep = env("LICENSE_SEPARATOR", " - ")
+
+        written = removed = blank_acc = 0
+        # utf-8-sig so Excel opens accented names correctly
         with open(out_file, "w", newline="", encoding="utf-8-sig") as f:
             writer = csv.writer(f)
-            writer.writerow(columns)
+            writer.writerow(columns + [LICENSE_COL])
             while True:
                 rows = cur.fetchmany(BATCH_SIZE)
                 if not rows:
                     break
-                writer.writerows([to_cell(v) for v in r] for r in rows)
-                written += len(rows)
-                print(f"[write] {written:,}/{expected:,}", end="\r")
+                out = []
+                for r in rows:
+                    # 1. drop never-accessed rows (0001-01-01)
+                    if is_null_date(r[i_acc]):
+                        removed += 1
+                        continue
+                    row = [to_cell(v) for v in r]
+                    # 2. last_accessed -> ISO 8601 UTC, like last_updated
+                    row[i_acc] = to_iso_utc(r[i_acc])
+                    if not row[i_acc]:
+                        blank_acc += 1
+                    # 3. License = role + sep + org
+                    parts = [str(r[i_role] or "").strip(), str(r[i_org] or "").strip()]
+                    row.append(sep.join(p for p in parts if p))
+                    out.append(row)
+                writer.writerows(out)
+                written += len(out)
+                print(f"[write] {written + removed:,}/{expected:,} processed", end="\r")
 
     print()
-    status = "OK" if written == expected else "MISMATCH"
-    print(f"[done] {status}: wrote {written:,} rows -> {out_file}")
+    status = "OK" if written + removed == expected else "MISMATCH"
+    print(f"[filter] Removed {removed:,} rows with {LAST_ACCESSED_COL} = 0001-01-01")
+    if blank_acc:
+        print(f"[warn] {blank_acc:,} kept rows have an empty {LAST_ACCESSED_COL}")
+    print(f"[done] {status}: wrote {written:,} rows (+{removed:,} removed = {expected:,}) -> {out_file}")
     if status != "OK":
         sys.exit(1)
 
