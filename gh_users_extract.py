@@ -10,6 +10,7 @@ import csv
 import os
 import re
 import sys
+import uuid
 from datetime import date, datetime, timezone
 from pathlib import Path
 
@@ -89,6 +90,13 @@ def to_cell(v):
 # ── Transform settings ──────────────────────────────────────────────
 LAST_ACCESSED_COL = "last_accessed"
 ROLE_COL, ORG_COL, LICENSE_COL = "role", "org", "License"
+ID_COL = "user_id"
+# Fixed namespace: the same username always gets the same user_id, run after run
+ID_NAMESPACE = uuid.uuid5(uuid.NAMESPACE_DNS, "github.users.flexera")
+
+
+def make_user_id(key):
+    return str(uuid.uuid5(ID_NAMESPACE, key)) if key else ""
 ISO_FMT = "%Y-%m-%dT%H:%M:%SZ"          # same shape as last_updated
 _STR_FORMATS = ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S.%f",
                 "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d", "%m/%d/%Y %H:%M:%S", "%m/%d/%Y")
@@ -158,13 +166,16 @@ def main():
         i_role = col_index(columns, ROLE_COL)
         i_org = col_index(columns, ORG_COL)
         sep = env("LICENSE_SEPARATOR", " - ")
+        id_fields = [c.strip() for c in env("ID_FIELDS", "username").split(",") if c.strip()]
+        i_ids = [col_index(columns, c) for c in id_fields]
+        seen_ids, dup_ids, blank_ids = set(), 0, 0
 
         written = removed = blank_acc = 0
         # utf-8-sig so Excel opens accented names correctly
         # write to a temp file first; the real file is only replaced on success
         with open(tmp_file, "w", newline="", encoding="utf-8-sig") as f:
             writer = csv.writer(f)
-            writer.writerow(columns + [LICENSE_COL])
+            writer.writerow([ID_COL] + columns + [LICENSE_COL])
             while True:
                 rows = cur.fetchmany(BATCH_SIZE)
                 if not rows:
@@ -183,7 +194,15 @@ def main():
                     # 3. License = role + sep + org
                     parts = [str(r[i_role] or "").strip(), str(r[i_org] or "").strip()]
                     row.append(sep.join(p for p in parts if p))
-                    out.append(row)
+                    # 4. user_id = stable UUID from ID_FIELDS (case-insensitive)
+                    key = "|".join(str(r[i] or "").strip().lower() for i in i_ids)
+                    uid = make_user_id(key.strip("|") and key)
+                    if not uid:
+                        blank_ids += 1
+                    elif uid in seen_ids:
+                        dup_ids += 1
+                    seen_ids.add(uid)
+                    out.append([uid] + row)
                 writer.writerows(out)
                 written += len(out)
                 print(f"[write] {written + removed:,}/{expected:,} processed", end="\r")
@@ -196,6 +215,11 @@ def main():
                  f"       This run's data is kept in {tmp_file}")
     status = "OK" if written + removed == expected else "MISMATCH"
     print(f"[filter] Removed {removed:,} rows with {LAST_ACCESSED_COL} = 0001-01-01")
+    if blank_ids:
+        print(f"[warn] {blank_ids:,} rows have no {'/'.join(id_fields)} -> blank {ID_COL}")
+    if dup_ids:
+        print(f"[warn] {dup_ids:,} rows share a {ID_COL} with an earlier row "
+              f"(same {'/'.join(id_fields)} appears more than once)")
     if blank_acc:
         print(f"[warn] {blank_acc:,} kept rows have an empty {LAST_ACCESSED_COL}")
     print(f"[done] {status}: wrote {written:,} rows (+{removed:,} removed = {expected:,}) -> {out_file}")
