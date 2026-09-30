@@ -175,11 +175,11 @@ def main():
         i_email = col_index(columns, EMAIL_COL)
         bad_email, bad_email_samples = 0, []
         sep = env("LICENSE_SEPARATOR", " - ")
-        id_fields = [c.strip() for c in env("ID_FIELDS", "username").split(",") if c.strip()]
+        id_fields = [c.strip() for c in env("ID_FIELDS", "username,org").split(",") if c.strip()]
         i_ids = [col_index(columns, c) for c in id_fields]
         seen_ids, dup_ids, blank_ids = set(), 0, 0
 
-        written = removed = blank_acc = 0
+        written = never = blank_acc = 0
         # utf-8-sig so Excel opens accented names correctly
         # write to a temp file first; the real file is only replaced on success
         with open(tmp_file, "w", newline="", encoding="utf-8-sig") as f:
@@ -191,21 +191,23 @@ def main():
                     break
                 out = []
                 for r in rows:
-                    # 1. drop never-accessed rows (0001-01-01)
-                    if is_null_date(r[i_acc]):
-                        removed += 1
-                        continue
-                    # 1b. drop rows whose email is not a real address (no @ etc.)
+                    # 1. drop rows whose email is not a real address (no @ etc.)
                     if not is_valid_email(r[i_email]):
                         bad_email += 1
                         if len(bad_email_samples) < 10:
                             bad_email_samples.append(f"{r[i_role]} | {r[i_org]} | {r[i_email]!r}")
                         continue
                     row = [to_cell(v) for v in r]
-                    # 2. last_accessed -> ISO 8601 UTC, like last_updated
-                    row[i_acc] = to_iso_utc(r[i_acc])
-                    if not row[i_acc]:
-                        blank_acc += 1
+                    # 2. last_accessed -> ISO 8601 UTC, like last_updated.
+                    #    0001-01-01 = never accessed: row is KEPT (user assignment)
+                    #    but left blank, so it is not sent as an activity.
+                    if is_null_date(r[i_acc]):
+                        never += 1
+                        row[i_acc] = ""
+                    else:
+                        row[i_acc] = to_iso_utc(r[i_acc])
+                        if not row[i_acc]:
+                            blank_acc += 1
                     # 3. License = role + sep + org
                     parts = [str(r[i_role] or "").strip(), str(r[i_org] or "").strip()]
                     row.append(sep.join(p for p in parts if p))
@@ -220,7 +222,7 @@ def main():
                     out.append([uid] + row)
                 writer.writerows(out)
                 written += len(out)
-                print(f"[write] {written + removed:,}/{expected:,} processed", end="\r")
+                print(f"[write] {written + bad_email:,}/{expected:,} processed", end="\r")
 
     print()
     try:
@@ -228,8 +230,9 @@ def main():
     except PermissionError:
         sys.exit(f"[save] {out_file.name} is open (probably in Excel). Close it and re-run.\n"
                  f"       This run's data is kept in {tmp_file}")
-    status = "OK" if written + removed + bad_email == expected else "MISMATCH"
-    print(f"[filter] Removed {removed:,} rows with {LAST_ACCESSED_COL} = 0001-01-01")
+    status = "OK" if written + bad_email == expected else "MISMATCH"
+    print(f"[info] Kept {never:,} never-accessed rows (0001-01-01): in user assignments, "
+          f"not in activities; {LAST_ACCESSED_COL} left blank")
     print(f"[filter] Removed {bad_email:,} rows with an invalid {EMAIL_COL}")
     for sample in bad_email_samples:
         print(f"         e.g. {sample}")
@@ -240,9 +243,14 @@ def main():
               f"(same {'/'.join(id_fields)} appears more than once)")
     if blank_acc:
         print(f"[warn] {blank_acc:,} kept rows have an empty {LAST_ACCESSED_COL}")
-    print(f"[done] {status}: wrote {written:,} rows (+{removed + bad_email:,} removed = {expected:,}) -> {out_file}")
+    print(f"[done] {status}: wrote {written:,} rows (+{bad_email:,} removed = {expected:,}) -> {out_file}")
     if status != "OK":
         sys.exit(1)
+
+    if (os.getenv("FLEXERA_PUSH") or "no").strip().lower() == "yes":
+        sys.path.insert(0, str(BASE_DIR))  # embeddable Python doesn't add the script folder
+        from gh_flexera_push import push_all
+        push_all(out_file)
 
 
 if __name__ == "__main__":
