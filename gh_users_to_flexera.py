@@ -19,6 +19,7 @@ Flexera mappings (GitHub Enterprise, UAT)
     Unique user identifier = user_id | Activity name + recorded value = last_accessed
 
 All credentials, API URLs and config IDs come from .env in the same folder.
+Every run is appended to output/gh_users_to_flexera.log (rolls over at 5 MB; no secrets logged).
 Set FLEXERA_PUSH=no in .env to extract and build the files without pushing.
 
 Requires:  python -m pip install pyodbc python-dotenv requests
@@ -48,6 +49,40 @@ except ImportError:
 
 BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
+
+
+# ── Run log: everything printed (incl. errors) also goes to one log file ──
+class _Tee:
+    """Mirrors console output into the log, timestamping each line.
+    Progress lines ending in \r are shown on screen but not logged."""
+    def __init__(self, stream, log):
+        self.stream, self.log, self.buf = stream, log, ""
+
+    def write(self, text):
+        self.stream.write(text)
+        for ch in text:
+            if ch == "\n":
+                self.log.write(f"{datetime.now():%Y-%m-%d %H:%M:%S}  {self.buf}\n")
+                self.buf = ""
+            elif ch == "\r":
+                self.buf = ""
+            else:
+                self.buf += ch
+        self.log.flush()
+
+    def flush(self):
+        self.stream.flush()
+
+
+def start_log():
+    log_path = BASE_DIR / (os.getenv("LOG_FILE") or "output/gh_users_to_flexera.log")
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    if log_path.exists() and log_path.stat().st_size > 5 * 1024 * 1024:  # keep it small
+        os.replace(log_path, log_path.with_suffix(log_path.suffix + ".1"))
+    log = open(log_path, "a", encoding="utf-8")
+    log.write(f"\n{'=' * 20} RUN {datetime.now():%Y-%m-%d %H:%M:%S} {'=' * 20}\n")
+    sys.stdout = _Tee(sys.stdout, log)
+    sys.stderr = _Tee(sys.stderr, log)
 
 SAFE_IDENT = re.compile(r"^[A-Za-z0-9_]+$")
 BATCH_SIZE = 5000
@@ -408,4 +443,5 @@ def main():
 
 
 if __name__ == "__main__":
+    start_log()
     main()
