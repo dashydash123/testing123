@@ -315,6 +315,9 @@ def main():
         cur = conn.cursor()
         expected = cur.execute(f"SELECT COUNT(*) FROM {fq_table}").fetchone()[0]
         print(f"[query] {fq_table}: {expected:,} rows on server")
+        if expected == 0:
+            sys.exit(f"[stop] {fq_table} is empty on the server (source refresh pending or failed?).\n"
+                     f"       Nothing written or pushed - last good {out_file.name} kept.")
 
         cur.execute(f"SELECT * FROM {fq_table}")
         columns = [c[0] for c in cur.description]
