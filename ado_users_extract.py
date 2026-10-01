@@ -23,6 +23,12 @@ Flexera mappings (Azure DevOps, UAT)
 All credentials, API URLs and config IDs come from .env in the same folder.
 Set FLEXERA_PUSH=no in .env to extract and build the files without pushing.
 
+Safety + logging
+  - If the table has 0 rows (e.g. mid-refresh or failed load), the run stops and the
+    last good CSV and Flexera files are kept untouched. Nothing is pushed.
+  - Every run is appended to output/ado_users_to_flexera.log (timestamped; rotates to
+    .log.1 at 5 MB). Override with LOG_FILE= in .env. Secrets are never printed.
+
 Requires:  python -m pip install pyodbc python-dotenv requests
            + Microsoft "ODBC Driver 18 for SQL Server" (or 17)
 """
@@ -31,6 +37,7 @@ import json
 import os
 import re
 import sys
+import traceback
 import uuid
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -53,6 +60,44 @@ load_dotenv(BASE_DIR / ".env")
 
 SAFE_IDENT = re.compile(r"^[A-Za-z0-9_]+$")
 BATCH_SIZE = 5000
+LOG_MAX_BYTES = 5 * 1024 * 1024
+
+
+# ── Log file: everything printed also goes to the log, timestamped ──
+class _Tee:
+    def __init__(self, stream, log):
+        self.stream, self.log, self.buf = stream, log, ""
+
+    def write(self, text):
+        self.stream.write(text)
+        self.buf += text
+        # live progress lines end in \r: show on console, keep out of the log
+        while True:
+            cut = min((i for i in (self.buf.find("\n"), self.buf.find("\r")) if i >= 0), default=-1)
+            if cut < 0:
+                break
+            line, ending, self.buf = self.buf[:cut], self.buf[cut], self.buf[cut + 1:]
+            if ending == "\n" and line.strip():
+                self.log.write(f"{datetime.now():%Y-%m-%d %H:%M:%S}  {line}\n")
+                self.log.flush()
+
+    def flush(self):
+        self.stream.flush()
+
+
+def start_log():
+    out_dir = BASE_DIR / (os.getenv("OUTPUT_DIR") or "output")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    log_path = Path(os.getenv("LOG_FILE") or out_dir / "ado_users_to_flexera.log")
+    if not log_path.is_absolute():
+        log_path = BASE_DIR / log_path
+    if log_path.exists() and log_path.stat().st_size > LOG_MAX_BYTES:
+        os.replace(log_path, log_path.with_name(log_path.name + ".1"))
+    log = open(log_path, "a", encoding="utf-8")
+    log.write("\n" + "=" * 70 + f"\n{datetime.now():%Y-%m-%d %H:%M:%S}  RUN START\n")
+    log.flush()
+    sys.stdout = _Tee(sys.__stdout__, log)
+    sys.stderr = _Tee(sys.__stderr__, log)
 
 
 def env(key, default=None, required=False):
@@ -282,7 +327,7 @@ def push(token, csv_path, config_id, label):
     print(f"          import task created (HTTP {resp.status_code})")
 
 
-def push_all(extract_csv=None):
+def push_all(extract_csv=None, send=True):
     out_dir = BASE_DIR / (os.getenv("OUTPUT_DIR") or "output")
     extract_csv = Path(extract_csv) if extract_csv else out_dir / (os.getenv("OUTPUT_FILE") or "tblADO_user_master_table.csv")
     rows = read_extract(extract_csv)
@@ -302,6 +347,9 @@ def push_all(extract_csv=None):
     print(f"[flexera] Activities : {len(activities):,} rows "
           f"({never:,} never-accessed left out -> 'No activity' in Flexera)")
 
+    if not send:
+        print(f"[flexera] FLEXERA_PUSH is not 'yes' - files built in {out_dir}, nothing sent to Flexera")
+        return
     token = get_token()
     if assignments:
         push(token, assign_csv, cfg("FLEXERA_ASSIGNMENTS_CONFIG_ID"), "user assignments")
@@ -328,6 +376,9 @@ def main():
         cur = conn.cursor()
         expected = cur.execute(f"SELECT COUNT(*) FROM {fq_table}").fetchone()[0]
         print(f"[query] {fq_table}: {expected:,} rows on server")
+        if expected == 0:
+            sys.exit(f"[stop] {fq_table} has 0 rows (source load running or failed?). "
+                     f"Last good {out_file.name} and Flexera files kept; nothing pushed.")
 
         cur.execute(f"SELECT * FROM {fq_table}")
         columns = [c[0] for c in cur.description]
@@ -431,11 +482,22 @@ def main():
     if status != "OK":
         sys.exit(1)
 
-    if (os.getenv("FLEXERA_PUSH") or "no").strip().lower() == "yes":
-        push_all(out_file)
-    else:
-        print("[flexera] FLEXERA_PUSH is not 'yes' - nothing sent to Flexera")
+    push_all(out_file, send=(os.getenv("FLEXERA_PUSH") or "no").strip().lower() == "yes")
 
 
 if __name__ == "__main__":
-    main()
+    start_log()
+    try:
+        main()
+        print("[run] Finished OK")
+    except SystemExit as e:
+        if e.code not in (None, 0):
+            if not isinstance(e.code, int):
+                print(e.code, file=sys.stderr)
+            print("[run] Stopped", file=sys.stderr)
+            sys.exit(1)
+        print("[run] Finished OK")
+    except Exception:
+        traceback.print_exc()
+        print("[run] Crashed", file=sys.stderr)
+        sys.exit(1)
